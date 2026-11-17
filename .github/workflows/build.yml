@@ -1,0 +1,153 @@
+name: Build LineageOS 24.0 (Android 17) for kiev
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Build target
+        type: choice
+        default: bootimage
+        options: [bootimage, vendorbootimage, recoveryimage, bacon]
+      variant:
+        description: Build variant
+        type: choice
+        default: userdebug
+        options: [userdebug, eng, user]
+      device_repo:
+        description: Device tree repo (use your own fork once you have a 24.0 branch)
+        default: LineageOS/android_device_motorola_kiev
+      tree_branch:
+        description: Branch to pull the kiev trees from (23.2 = Android 16 base to rebase)
+        default: lineage-23.2
+
+env:
+  CODENAME: kiev
+  DEVICE_PATH: device/motorola/kiev
+  LOS_BRANCH: lineage-24.0
+
+jobs:
+  build:
+    # Set a repo variable RUNNER_LABEL (Settings > Secrets and variables > Actions > Variables)
+    # to use a larger runner. Falls back to the free runner.
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-22.04' }}
+    timeout-minutes: 360
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space and add swap
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift
+          sudo docker image prune --all --force || true
+          sudo swapoff -a || true
+          sudo rm -f /swapfile
+          sudo mkdir -p /mnt/aosp && sudo chown "$USER" /mnt/aosp
+          sudo fallocate -l 16G /mnt/swapfile && sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile && sudo swapon /mnt/swapfile
+          df -h / /mnt
+          free -h
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git-core gnupg flex bison build-essential zip curl \
+            zlib1g-dev gcc-multilib g++-multilib libc6-dev-i386 libncurses5 \
+            x11proto-core-dev libx11-dev lib32z1-dev libgl1-mesa-dev libxml2-utils \
+            xsltproc unzip fontconfig python3 python-is-python3 ccache git-lfs rsync \
+            bc libssl-dev lz4 xz-utils
+          mkdir -p "$HOME/bin"
+          curl -s https://storage.googleapis.com/git-repo-downloads/repo > "$HOME/bin/repo"
+          chmod +x "$HOME/bin/repo"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          git config --global user.name  "builder"
+          git config --global user.email "builder@users.noreply.github.com"
+          git config --global color.ui false
+          git lfs install
+
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ env.CODENAME }}-${{ github.run_id }}
+          restore-keys: ccache-${{ env.CODENAME }}-
+
+      - name: repo init
+        working-directory: /mnt/aosp
+        run: |
+          repo init -u https://github.com/LineageOS/android.git -b "$LOS_BRANCH" \
+            --git-lfs --depth=1 --no-tags
+
+      - name: Generate local manifest from the device tree's lineage.dependencies
+        working-directory: /mnt/aosp
+        env:
+          DEVICE_REPO: ${{ inputs.device_repo }}
+          TREE_BRANCH: ${{ inputs.tree_branch }}
+        run: |
+          mkdir -p .repo/local_manifests
+          python3 "$GITHUB_WORKSPACE/scripts/gen_manifest.py" .repo/local_manifests/kiev.xml
+          echo "---- generated manifest ----"
+          cat .repo/local_manifests/kiev.xml
+
+      - name: repo sync
+        working-directory: /mnt/aosp
+        run: |
+          repo sync -c -j8 --force-sync --no-clone-bundle --no-tags --optimized-fetch
+          df -h / /mnt
+
+      - name: Apply your patches (optional, patches/apply.sh)
+        working-directory: /mnt/aosp
+        run: |
+          if [ -f "$GITHUB_WORKSPACE/patches/apply.sh" ]; then
+            bash "$GITHUB_WORKSPACE/patches/apply.sh" /mnt/aosp
+          else
+            echo "no patches/apply.sh, skipping"
+          fi
+
+      - name: Build (time-boxed so cache and artifacts still upload)
+        id: build
+        working-directory: /mnt/aosp
+        env:
+          USE_CCACHE: "1"
+          CCACHE_EXEC: /usr/bin/ccache
+          CCACHE_DIR: /home/runner/.ccache
+          LC_ALL: C
+        run: |
+          ccache -o compression=true -M 9G
+          source build/envsetup.sh
+          breakfast "$CODENAME" "${{ inputs.variant }}"
+          if timeout 335m mka "${{ inputs.target }}"; then
+            echo "status=ok" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=failed_or_timed_out" >> "$GITHUB_OUTPUT"
+            echo "::warning::Build did not finish. Check out/error.log, then re-run to continue from ccache."
+            exit 0
+          fi
+
+      - name: Save ccache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ env.CODENAME }}-${{ github.run_id }}
+
+      - name: Upload images
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kiev-${{ inputs.target }}-images
+          path: |
+            /mnt/aosp/out/target/product/kiev/*.img
+            /mnt/aosp/out/target/product/kiev/lineage-*.zip
+          if-no-files-found: warn
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kiev-build-logs
+          path: |
+            /mnt/aosp/out/error.log
+            /mnt/aosp/out/verbose.log.gz
+            /mnt/aosp/.repo/local_manifests/kiev.xml
+          if-no-files-found: ignore
